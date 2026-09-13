@@ -46,7 +46,11 @@ vertex FragmentIn singleStageSplatVertexShader(uint vertexID [[vertex_id]],
                        idx.splatIndex);
 }
 
-fragment half4 singleStageSplatFragmentShader(FragmentIn in [[stage_in]]) {
+fragment half4 singleStageSplatFragmentShader(FragmentIn in [[stage_in]],
+                                             texture2d<float, access::read> opaqueDepth [[texture(0)]]) {
+    if (splatOccluded(in.position, opaqueDepth)) {
+        discard_fragment();
+    }
     half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);
     return half4(alpha * in.color.rgb, alpha);
 }

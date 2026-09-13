@@ -219,3 +219,10 @@ half splatFragmentAlpha(half2 relativePosition, half splatAlpha) {
     half negativeMagnitudeSquared = -dot(relativePosition, relativePosition);
     return (negativeMagnitudeSquared < -kBoundsRadiusSquared) ? 0 : exp(0.5 * negativeMagnitudeSquared) * splatAlpha;
 }
+
+bool splatOccluded(float4 position, texture2d<float, access::read> opaqueDepth) {
+    if (is_null_texture(opaqueDepth)) {
+        return false;
+    }
+    return position.z >= opaqueDepth.read(uint2(position.xy)).r;
+}

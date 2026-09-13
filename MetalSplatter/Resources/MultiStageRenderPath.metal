@@ -71,7 +71,11 @@ vertex FragmentIn multiStageSplatVertexShader(uint vertexID [[vertex_id]],
 }
 
 fragment FragmentStore multiStageSplatFragmentShader(FragmentIn in [[stage_in]],
-                                                     FragmentValues previousFragmentValues [[imageblock_data]]) {
+                                                     FragmentValues previousFragmentValues [[imageblock_data]],
+                                                     texture2d<float, access::read> opaqueDepth [[texture(0)]]) {
+    if (splatOccluded(in.position, opaqueDepth)) {
+        discard_fragment();
+    }
     FragmentStore out;
 
     half alpha = splatFragmentAlpha(in.relativePosition, in.color.a);

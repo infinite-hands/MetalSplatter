@@ -757,6 +757,7 @@ public final class SplatRenderer: @unchecked Sendable {
     ///   - colorTexture: The texture to render color output to
     ///   - colorStoreAction: The store action for the color attachment
     ///   - depthTexture: Optional depth texture for depth output
+    ///   - opaqueDepthTexture: Optional single-view r32Float opaque depth, in Metal [0, 1] forward-Z and framebuffer pixel coordinates. Hidden splat fragments are discarded before blending.
     ///   - rasterizationRateMap: Optional rasterization rate map for variable rate shading
     ///   - renderTargetArrayLength: The render target array length (for layered rendering)
     ///   - accessTimeout: Maximum time to block waiting for render access (when exclusive chunk access is held, or when maxSimultaneousRenders are already in flight). Defaults to 0.1s.
@@ -772,7 +773,21 @@ public final class SplatRenderer: @unchecked Sendable {
                        renderTargetArrayLength: Int,
                        accessTimeout: TimeInterval = 0.1,
                        sortTimeout: TimeInterval = 0.1,
+                       opaqueDepthTexture: MTLTexture? = nil,
                        to commandBuffer: MTLCommandBuffer) throws -> Bool {
+        if let opaqueDepthTexture {
+            guard viewports.count == 1, renderTargetArrayLength == 1,
+                  opaqueDepthTexture.textureType == .type2D,
+                  opaqueDepthTexture.pixelFormat == .r32Float,
+                  opaqueDepthTexture.sampleCount == 1,
+                  opaqueDepthTexture.width == colorTexture.width,
+                  opaqueDepthTexture.height == colorTexture.height,
+                  opaqueDepthTexture.usage.contains(.shaderRead) else {
+                throw NSError(domain: "MetalSplatter", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "Opaque depth requires a matching single-view r32Float shader-readable texture"
+                ])
+            }
+        }
         // Try to acquire render access, respecting exclusive access, serial render, and maxSimultaneousRenders
         let deadline = Date().addingTimeInterval(accessTimeout)
         while true {
@@ -921,6 +936,7 @@ public final class SplatRenderer: @unchecked Sendable {
             renderEncoder.setDepthStencilState(renderState.singleStageDepthState)
         }
 
+        renderEncoder.setFragmentTexture(opaqueDepthTexture, index: 0)
         renderEncoder.setVertexBuffer(dynamicUniformBuffers, offset: renderState.uniformBufferOffset, index: BufferIndex.uniforms.rawValue)
         renderEncoder.setVertexBuffer(chunksBuffer, offset: 0, index: BufferIndex.chunks.rawValue)
         renderEncoder.setVertexBuffer(splatIndexBuffer.buffer, offset: 0, index: BufferIndex.splatIndex.rawValue)

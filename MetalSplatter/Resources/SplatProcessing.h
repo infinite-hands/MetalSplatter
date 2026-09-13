@@ -37,3 +37,5 @@ FragmentIn splatVertex(Splat splat,
 // MARK: - Fragment Processing
 
 half splatFragmentAlpha(half2 relativePosition, half splatAlpha);
+
+bool splatOccluded(float4 position, texture2d<float, access::read> opaqueDepth);

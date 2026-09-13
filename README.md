@@ -12,6 +12,25 @@ This is a Swift/Metal library for rendering scenes captured via the techniques d
 
 ## Getting Started
 
+### Infinite Hands opaque-depth integration
+
+This fork adds optional `opaqueDepthTexture` input to `SplatRenderer.render`,
+based on upstream commit `464eb37c55d90d7362a79120fdf8b50d4ae03296`.
+Supply a shader-readable, single-sampled `r32Float` 2D texture matching the color
+attachment dimensions, with opaque geometry depth in Metal forward-Z [0, 1]
+coordinates (near = 0, far/background = 1). Pixel coordinates must match the
+render framebuffer. The input supports one view/layer and both splat pipelines.
+Fragments at or behind opaque depth are discarded before alpha accumulation;
+foreground splats retain their normal transparency. Passing `nil` preserves
+upstream rendering. Callers must finish uploading depth before encoding the pass
+and keep that texture unchanged until GPU completion.
+
+This fixes mixed-depth compositing, not inaccurate scan geometry: splats truly
+in front of a replacement surface remain visible. `OpaqueDepthTests` exercises
+both pipelines, optional input, and invalid input rejection on a Metal device.
+
+### Upstream sample app
+
 You're right, the documentation is entirely missing; it's a major TODO list item. In the meantime, feel free to try out the sample app -- just, like I said, don't expect much.
 
 1. Get yourself a gaussian splat PLY (or spz or .splat) file (see Resources below)
