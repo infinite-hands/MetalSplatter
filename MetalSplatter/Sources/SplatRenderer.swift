@@ -763,6 +763,7 @@ public final class SplatRenderer: @unchecked Sendable {
     ///   - accessTimeout: Maximum time to block waiting for render access (when exclusive chunk access is held, or when maxSimultaneousRenders are already in flight). Defaults to 0.1s.
     ///   - sortTimeout: Maximum time to block the caller in order to wait for a valid sorted index buffer to be available. This does not cause the method to wait for the latest sort to complete, it only causes it to block if no sort at all has completed since the last time the sort was invalidated (e.g. if chunks were changed). Passing 0 disables blocking, but may result in a flash after a chunk update instead of a dropped frame. Defaults to blocking 0.1s.
     ///   - commandBuffer: The command buffer to encode rendering commands into
+    ///   - requireCurrentSort: Wait for indices sorted for this camera pose and the current chunk generation; drop the frame on timeout.
     /// - Returns: `true` if rendering was performed, `false` if rendering was skipped (e.g., due to exclusive access timeout or no splats). When `false` is returned, the caller should drop the frame rather than presenting an incomplete render.
     @discardableResult
     public func render(viewports: [ViewportDescriptor],
@@ -773,6 +774,7 @@ public final class SplatRenderer: @unchecked Sendable {
                        renderTargetArrayLength: Int,
                        accessTimeout: TimeInterval = 0.1,
                        sortTimeout: TimeInterval = 0.1,
+                       requireCurrentSort: Bool = false,
                        opaqueDepthTexture: MTLTexture? = nil,
                        to commandBuffer: MTLCommandBuffer) throws -> Bool {
         if let opaqueDepthTexture {
@@ -839,12 +841,14 @@ public final class SplatRenderer: @unchecked Sendable {
         sorter.updateCameraPose(position: cameraPose.position, forward: cameraPose.forward)
 
         // Try to get sorted indices, optionally waiting up to sortTimeout
-        var splatIndexBuffer = sorter.tryObtainSortedIndices()
+        let requiredPose = requireCurrentSort
+            ? SplatSorter.CameraPose(position: cameraPose.position, forward: cameraPose.forward) : nil
+        var splatIndexBuffer = sorter.tryObtainSortedIndices(for: requiredPose)
         if splatIndexBuffer == nil && sortTimeout > 0 {
             let deadline = Date().addingTimeInterval(sortTimeout)
             while splatIndexBuffer == nil && Date() < deadline {
-                Thread.sleep(forTimeInterval: 0.01)
-                splatIndexBuffer = sorter.tryObtainSortedIndices()
+                Thread.sleep(forTimeInterval: requireCurrentSort ? 0.001 : 0.01)
+                splatIndexBuffer = sorter.tryObtainSortedIndices(for: requiredPose)
             }
         }
         guard let splatIndexBuffer else { return false }

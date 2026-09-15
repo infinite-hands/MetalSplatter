@@ -95,6 +95,8 @@ class SplatSorter: @unchecked Sendable {
         let buffer: MetalBuffer<ChunkedSplatIndex>
         var referenceCount: Int = 0
         var isValid: Bool = false
+        var cameraPose: CameraPose? = nil
+        var chunkGeneration: UInt64? = nil
     }
 
     private struct State {
@@ -171,6 +173,7 @@ class SplatSorter: @unchecked Sendable {
     func setChunks(_ chunks: [ChunkReference]) {
         state.withLock { state in
             state.chunks = chunks
+            state.chunkGeneration &+= 1
             state.needsSort = !chunks.isEmpty
         }
         ensureSortLoopRunning()
@@ -322,11 +325,16 @@ class SplatSorter: @unchecked Sendable {
 
     /// Updates the camera pose, triggering a new sort if needed.
     func updateCameraPose(position: SIMD3<Float>, forward: SIMD3<Float>) {
-        state.withLock { state in
-            state.cameraPose = CameraPose(position: position, forward: forward)
+        let changed = state.withLock { state in
+            let pose = CameraPose(position: position, forward: forward)
+            guard pose != state.cameraPose else { return false }
+            state.cameraPose = pose
             state.needsSort = true
+            return true
         }
-        ensureSortLoopRunning()
+        if changed {
+            ensureSortLoopRunning()
+        }
     }
 
     // MARK: - Index Buffer Access (Scoped - Preferred)
@@ -360,7 +368,7 @@ class SplatSorter: @unchecked Sendable {
     /// Attempts to obtain a reference to the current sorted index buffer without waiting.
     /// Returns nil immediately if no valid buffer is available.
     /// Caller must call `releaseSortedIndices` when done if a buffer is returned.
-    func tryObtainSortedIndices() -> MetalBuffer<ChunkedSplatIndex>? {
+    func tryObtainSortedIndices(for cameraPose: CameraPose? = nil) -> MetalBuffer<ChunkedSplatIndex>? {
         state.withLock { state -> MetalBuffer<ChunkedSplatIndex>? in
             // Don't provide buffers during exclusive access
             guard !state.hasExclusiveAccess else { return nil }
@@ -374,6 +382,13 @@ class SplatSorter: @unchecked Sendable {
             // Never hand out a buffer while a sort pass is writing into it.
             guard state.sortingBufferIndex != validIndex else {
                 return nil
+            }
+
+            if let cameraPose {
+                guard state.indexBuffers[validIndex].cameraPose == cameraPose,
+                      state.indexBuffers[validIndex].chunkGeneration == state.chunkGeneration else {
+                    return nil
+                }
             }
 
             // Increment reference count and return
@@ -400,6 +415,7 @@ class SplatSorter: @unchecked Sendable {
     /// Any unreleased references become stale - callers should release them promptly.
     func invalidateAllBuffers() {
         state.withLock { state in
+            state.chunkGeneration &+= 1
             for i in 0..<state.indexBuffers.count {
                 state.indexBuffers[i].isValid = false
             }
@@ -438,6 +454,7 @@ class SplatSorter: @unchecked Sendable {
                 state.hasExclusiveAccess = true
                 if invalidateIndexBuffers {
                     state.pendingInvalidation = true
+                    state.chunkGeneration &+= 1
                 }
                 return true
             }
@@ -657,6 +674,8 @@ class SplatSorter: @unchecked Sendable {
             }
 
             state.indexBuffers[targetBufferIndex].isValid = true
+            state.indexBuffers[targetBufferIndex].cameraPose = cameraPose
+            state.indexBuffers[targetBufferIndex].chunkGeneration = chunkGeneration
             state.mostRecentValidBufferIndex = targetBufferIndex
 
             // Drain pending sort completion handlers on successful sort
