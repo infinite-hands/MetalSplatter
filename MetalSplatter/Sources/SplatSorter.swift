@@ -1,3 +1,4 @@
+import Dispatch
 import Metal
 import simd
 
@@ -132,13 +133,10 @@ class SplatSorter: @unchecked Sendable {
     var onSortComplete: (@Sendable (TimeInterval) -> Void)?
 
     // Temporary storage for sorting (reused across iterations, only accessed from sort task)
-    private var sortTempStorage: [SplatReferenceAndDepth] = []
-
-    private struct SplatReferenceAndDepth {
-        var chunkIndex: UInt16
-        var splatIndex: UInt32
-        var depth: Float
-    }
+    private var sortKeys: [UInt32] = []
+    private var sortKeysScratch: [UInt32] = []
+    private var sortOrder: [UInt32] = []
+    private var sortOrderScratch: [UInt32] = []
 
     // MARK: - Initialization
 
@@ -606,32 +604,39 @@ class SplatSorter: @unchecked Sendable {
         let totalSplatCount = chunks.reduce(0) { $0 + $1.buffer.count }
         let targetBuffer = state.withLock { $0.indexBuffers[targetBufferIndex].buffer }
 
-        // Phase 1: Read splat positions from all chunks and compute depths
-        // Ensure temp storage is sized correctly
-        if sortTempStorage.count != totalSplatCount {
-            sortTempStorage = Array(repeating: SplatReferenceAndDepth(chunkIndex: 0, splatIndex: 0, depth: 0), count: totalSplatCount)
+        // Phase 1: Compute a back-to-front radix key per splat, in parallel across splat blocks
+        if sortKeys.count != totalSplatCount {
+            sortKeys = Array(repeating: 0, count: totalSplatCount)
+            sortKeysScratch = sortKeys
+            sortOrder = sortKeys
+            sortOrderScratch = sortKeys
         }
-
-        // Compute depth for each splat across all chunks
-        var tempIndex = 0
-        if SplatRenderer.Constants.sortByDistance {
-            for chunk in chunks {
-                for i in 0..<chunk.buffer.count {
-                    let position = chunk.buffer.values[i].position.simd
-                    sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
-                    sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = (position - cameraPose.position).lengthSquared
-                    tempIndex += 1
-                }
-            }
-        } else {
-            for chunk in chunks {
-                for i in 0..<chunk.buffer.count {
-                    let position = chunk.buffer.values[i].position.simd
-                    sortTempStorage[tempIndex].chunkIndex = chunk.chunkIndex
-                    sortTempStorage[tempIndex].splatIndex = UInt32(i)
-                    sortTempStorage[tempIndex].depth = dot(position, cameraPose.forward)
-                    tempIndex += 1
+        var chunkStarts: [Int] = []
+        var runningStart = 0
+        for chunk in chunks {
+            chunkStarts.append(runningStart)
+            runningStart += chunk.buffer.count
+        }
+        let byDistance = SplatRenderer.Constants.sortByDistance
+        sortKeys.withUnsafeMutableBufferPointer { keys in
+            sortOrder.withUnsafeMutableBufferPointer { order in
+                for (chunkSlot, chunk) in chunks.enumerated() {
+                    let base = chunkStarts[chunkSlot]
+                    let count = chunk.buffer.count
+                    let points = chunk.buffer.values
+                    let blockCount = max(1, min(Self.sortBlockCount, count / Self.minimumSplatsPerBlock))
+                    DispatchQueue.concurrentPerform(iterations: blockCount) { block in
+                        let lower = count * block / blockCount
+                        let upper = count * (block + 1) / blockCount
+                        for i in lower..<upper {
+                            let position = points[i].position.simd
+                            let depth = byDistance
+                                ? (position - cameraPose.position).lengthSquared
+                                : dot(position, cameraPose.forward)
+                            keys[base + i] = ~Self.orderedBits(depth)
+                            order[base + i] = UInt32(base + i)
+                        }
+                    }
                 }
             }
         }
@@ -641,19 +646,27 @@ class SplatSorter: @unchecked Sendable {
             state.isReadingChunks = false
         }
 
-        // Phase 2: Sort by depth (back to front, so larger depth first)
-        sortTempStorage.sort { $0.depth > $1.depth }
+        // Phase 2: Stable LSD radix sort by key (back to front, so larger depth first)
+        Self.radixSort(keys: &sortKeys, order: &sortOrder, keysScratch: &sortKeysScratch, orderScratch: &sortOrderScratch)
 
         // Phase 3: Write sorted indices to buffer
         do {
             try targetBuffer.ensureCapacity(totalSplatCount)
             targetBuffer.count = totalSplatCount
-            for i in 0..<totalSplatCount {
-                let ref = sortTempStorage[i]
-                targetBuffer.values[i] = ChunkedSplatIndex(
-                    chunkIndex: ref.chunkIndex,
-                    splatIndex: ref.splatIndex
-                )
+            let chunkIndices = chunks.map(\.chunkIndex)
+            sortOrder.withUnsafeBufferPointer { order in
+                var chunkSlot = 0
+                for i in 0..<totalSplatCount {
+                    let flat = Int(order[i])
+                    // Chunks are few; scan to the owning chunk from the previous one's slot.
+                    if flat < chunkStarts[chunkSlot] || (chunkSlot + 1 < chunkStarts.count && flat >= chunkStarts[chunkSlot + 1]) {
+                        chunkSlot = chunkStarts.lastIndex(where: { $0 <= flat })!
+                    }
+                    targetBuffer.values[i] = ChunkedSplatIndex(
+                        chunkIndex: chunkIndices[chunkSlot],
+                        splatIndex: UInt32(flat - chunkStarts[chunkSlot])
+                    )
+                }
             }
         } catch {
             // Buffer allocation failed, abort this sort
@@ -693,6 +706,69 @@ class SplatSorter: @unchecked Sendable {
             for handler in completionHandlers {
                 handler()
             }
+        }
+    }
+}
+
+// MARK: - Radix Sort
+
+extension SplatSorter {
+    fileprivate static let sortBlockCount = 16
+    fileprivate static let minimumSplatsPerBlock = 16_384
+    private static let radixBits = 11
+    private static let radixPasses = 3
+
+    /// Maps a float to bits whose unsigned order matches the float order.
+    fileprivate static func orderedBits(_ value: Float) -> UInt32 {
+        let bits = value.bitPattern
+        return (bits & 0x8000_0000) != 0 ? ~bits : bits | 0x8000_0000
+    }
+
+    fileprivate static func radixSort(keys: inout [UInt32], order: inout [UInt32],
+                                      keysScratch: inout [UInt32], orderScratch: inout [UInt32]) {
+        let count = keys.count
+        let buckets = 1 << radixBits
+        let mask = UInt32(buckets - 1)
+        var histograms = [Int](repeating: 0, count: buckets * radixPasses)
+        keys.withUnsafeBufferPointer { source in
+            histograms.withUnsafeMutableBufferPointer { counts in
+                for key in source {
+                    for pass in 0..<radixPasses {
+                        counts[pass * buckets + Int((key >> UInt32(pass * radixBits)) & mask)] += 1
+                    }
+                }
+            }
+        }
+        for pass in 0..<radixPasses {
+            let shift = UInt32(pass * radixBits)
+            histograms.withUnsafeMutableBufferPointer { counts in
+                var offset = 0
+                for bucket in 0..<buckets {
+                    let size = counts[pass * buckets + bucket]
+                    counts[pass * buckets + bucket] = offset
+                    offset += size
+                }
+            }
+            keys.withUnsafeBufferPointer { sourceKeys in
+                order.withUnsafeBufferPointer { sourceOrder in
+                    keysScratch.withUnsafeMutableBufferPointer { targetKeys in
+                        orderScratch.withUnsafeMutableBufferPointer { targetOrder in
+                            histograms.withUnsafeMutableBufferPointer { counts in
+                                for i in 0..<count {
+                                    let key = sourceKeys[i]
+                                    let slot = pass * buckets + Int((key >> shift) & mask)
+                                    let destination = counts[slot]
+                                    counts[slot] = destination + 1
+                                    targetKeys[destination] = key
+                                    targetOrder[destination] = sourceOrder[i]
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            swap(&keys, &keysScratch)
+            swap(&order, &orderScratch)
         }
     }
 }

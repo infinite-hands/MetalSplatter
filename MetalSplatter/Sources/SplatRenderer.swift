@@ -750,6 +750,12 @@ public final class SplatRenderer: @unchecked Sendable {
         return renderEncoder
     }
 
+    /// Starts sorting for these viewports' camera pose, so several renderers can sort at once before any renders.
+    public func prepareSort(viewports: [ViewportDescriptor]) {
+        let cameraPose = Self.cameraWorldPose(forViewports: viewports)
+        sorter.updateCameraPose(position: cameraPose.position, forward: cameraPose.forward)
+    }
+
     /// Renders the gaussian splats to the given command buffer.
     ///
     /// - Parameters:
